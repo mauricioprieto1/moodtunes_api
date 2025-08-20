@@ -1,68 +1,117 @@
 # build_mood_dataset.py
-# Purpose:
-#   - Use the GoEmotions dataset as ground truth (we use its labels!)
-#   - Map GoEmotions -> your 8 moods
-#   - For Train/Validation ONLY, add negation-aware keyword/slang/emoji/emoticon boosts
-#   - Keep Test "pure" (no boosts) so evaluation is apples-to-apples
-#
-# Output (Azure Language Studio import format):
-#   artifacts/<PROJECT_NAME>/labels.json
-#   artifacts/<PROJECT_NAME>/docs/{Train|Validation|Test}/doc_*.txt
-#
-# How to use:
-#   1) Edit PROJECT_NAME/CONTAINER_NAME if needed
-#   2) python build_mood_dataset.py
-#   3) Upload ONLY labels.json (overwrite) to <container>/<PROJECT_NAME>/labels.json
-#   4) In Language Studio -> Data labeling -> Reimport labels -> Train
+# MoodTunes – build an Azure Language Studio dataset (Custom Multi-Label Classification)
+# - Uses GoEmotions labels (we DO use the dataset’s labeling)
+# - Maps GoEmotions -> 8 moods
+# - Train/Validation ONLY: add negation-aware keyword/slang/emoji boosts to lift minorities
+# - TRAIN rebalancing: per-label quota to reduce majority dominance
+# - TEST kept "pure" (base mapping only) for honest evaluation
 
 from datasets import load_dataset
 from pathlib import Path
 from collections import Counter
-import json
-import re
+import json, re, random
 from tqdm import tqdm
 
-# ================= USER CONFIG =================
+# ===================== USER CONFIG =====================
 PROJECT_NAME   = "moodtunesv2-moodclass-v1"  # blob folder + project name shown in Studio
 CONTAINER_NAME = "moodtunesv2-data"          # your blob container
 LANG           = "en-us"
 
-OUT_ROOT   = Path("artifacts/") / PROJECT_NAME
+OUT_ROOT   = Path("artifacts") / PROJECT_NAME
 DOCS_LOCAL = OUT_ROOT / "docs"
 BLOB_PREFIX = PROJECT_NAME
 
-# Full run => None; put small integers to do quick caps
+# Quick caps (None = full split)
 CAP_TRAIN = None
 CAP_VAL   = None
 CAP_TEST  = None
 
-# Minimum text length to keep (tiny strings like "lol" alone are noisy)
-MIN_CHARS = 2
+# Filter out ultra-short texts (pure noise like "lol")
+MIN_CHARS = 3
 
+# Your moods
 MOODS = ["happy","calm","sad","melancholy","energetic","angry","anxious","romantic"]
-# ===============================================
+
+# ===== TRAIN rebalancing (downsample majority) =====
+TARGET_TRAIN_PER_LABEL = 7000   # approximate per-label target
+KEEP_SATURATED_PROB    = 0.15   # keep prob for docs that only hit saturated labels
+RANDOM_SEED            = 42
+random.seed(RANDOM_SEED)
+# ====================================================
 
 
-# ===== 1) GoEmotions -> Mood (you ARE using the dataset’s labels) =====
+# Dataset labels--------------------------------------
+
+
+# admiration
+# amusement
+# anger
+# annoyance
+# approval
+# caring
+# confusion
+# curiosity
+# desire
+# disappointment
+# disapproval
+# disgust
+# embarrassment
+# excitement
+# fear
+# gratitude
+# grief
+# joy
+# love
+# nervousness
+# optimism
+# pride
+# realization
+# relief
+# remorse
+# sadness
+# surprise
+# neutral
+
+
+
+
+
+
+# ===== 1) GoEmotions -> Mood base mapping =====
+# (Conservative tweak to reduce "free happy" inflation: 'approval' -> [])
 GO_TO_MOODS = {
-    # pleasant/positive
-    "admiration": ["happy"], "amusement": ["happy"], "approval": ["happy"],
-    "gratitude": ["happy"], "joy": ["happy"], "optimism": ["happy"], "pride": ["happy"],
-    "caring": ["romantic"],
+    # strongly positive
+    "joy": ["happy"],
+    "admiration": ["happy"],
+    "gratitude": ["calm","happy"],   # often low-arousal positive
     "relief": ["calm","happy"],
-    "love": ["romantic"], "desire": ["romantic"],
+
+    # share upbeat with energetic; cut "approval" from default happy
+    "approval": [],
+    "optimism": ["energetic","happy"],
+    "pride": ["energetic","happy"],
+    "amusement": ["energetic","happy"],
+
+    # affection / romance
+    "caring": ["romantic","calm"],
+    "love": ["romantic"],
+    "desire": ["romantic","energetic"],
+
+    # high arousal positive
     "excitement": ["energetic"],
-    # negative
+
+    # negatives
     "anger": ["angry"], "annoyance": ["angry"], "disapproval": ["angry"], "disgust": ["angry"],
     "fear": ["anxious"], "nervousness": ["anxious"], "embarrassment": ["anxious"],
-    "sadness": ["sad"], "disappointment": ["sad"], "grief": ["melancholy"], "remorse": ["melancholy"],
-    # ignored on their own
+    "sadness": ["sad"], "disappointment": ["sad"],
+    "grief": ["melancholy"], "remorse": ["melancholy"],
+
+    # ignored alone (handled by heuristics if text clearly signals a mood)
     "curiosity": [], "realization": [], "confusion": [], "surprise": [], "neutral": []
 }
 
 
-# ===== 2) Heuristic boosts (rich lexicons + slang + emojis + emoticons) =====
-# Unicode emoji “charsets”: any char from the set indicates that mood
+# ===== 2) Heuristic boosts: slang/emojis/emoticons/genres (Train/Val only) =====
 HAPPY_EMO   = "🙂😊😀😄😁😸😻✨🎉🥳👍👌🙌😍🥰❤️"
 CALM_EMO    = "😌🧘🌅🌄🌙🍵☕🌧️🌿"
 SAD_EMO     = "😢😭☹️🙁💔🥀"
@@ -72,16 +121,14 @@ ENERG_EMO   = "💪🔥⚡🏃🏋️‍♂️🏋️‍♀️🎧🎶"
 ROM_EMO     = "💖💘💞💓💗❤️‍🔥💍💑"
 MEL_EMO     = "🥺💔😔"
 
-# Classic ASCII emoticons & slang
 HAPPY_EMOTICONS = re.compile(r"(?:\:\-?\)|\:D|=D|=\)|xD|XD|\^\_\^|\:-?P|:p)", re.I)
 SAD_EMOTICONS   = re.compile(r"(?:\:\-?\(|:\'\(|;\(|T_T|;-;|</3|:\[|D:|\:\()", re.I)
-ANX_EMOTICONS   = re.compile(r"(?:\:\-?\/|\:-?S|:s)", re.I)     # “:/”, “:S”
+ANX_EMOTICONS   = re.compile(r"(?:\:\-?\/|\:-?S|:s)", re.I)
 ROM_EMOTICONS   = re.compile(r"(?:<3|❤)", re.I)
 
 HAPPY_SLANG  = re.compile(r"\b(lol|lmao|lmfao|rofl|haha+|hehe+|yay+|woo+hoo+|yass+|yas+|yess+|pog(?:gers)?)\b", re.I)
 ENERG_SLANG  = re.compile(r"\b(lets?\s?go+|goooo+|grind|turnt|turn\s?up|amped|hyped?|cranked|beast\s?mode)\b", re.I)
 
-# Large keyword bundles per mood (hashtags & music subgenres included)
 CALM_WORDS = re.compile(
     r"(?:calm|chill|chilled|chillin'?|relax(?:ed|ing)?|cozy|peaceful|serene|soothing|"
     r"ambient|instrumental|acoustic|piano|study|focus|concentrat(?:e|ing)|sleep|nap|"
@@ -125,21 +172,13 @@ WORD_RX = re.compile(r"[a-z']+", re.I)
 def has_emoji(s: str, charset: str) -> bool:
     return any(ch in s for ch in charset)
 
-def not_negated(match_span: tuple[int,int], text: str, window_tokens: int = 5) -> bool:
-    """
-    True if there is no negation token within ~window_tokens before the match.
-    We scan ~80 chars left of match, tokenize, and inspect last N tokens.
-    """
-    start = match_span[0]
+def not_negated(span: tuple[int,int], text: str, window_tokens: int = 5) -> bool:
+    start = span[0]
     left = text[max(0, start-80):start].lower()
     tokens = WORD_RX.findall(left)
     return not any(tok in NEG_WORDS for tok in tokens[-window_tokens:])
 
 def guarded_search(rx: re.Pattern, text: str) -> bool:
-    """
-    Find the FIRST match of rx that is NOT negated; return True if found.
-    (We do not need all matches; one good hit is enough to add the label.)
-    """
     for m in rx.finditer(text):
         if not_negated(m.span(), text):
             return True
@@ -150,7 +189,6 @@ def guarded_search(rx: re.Pattern, text: str) -> bool:
 LABEL_NAMES: list[str] | None = None
 
 def to_label_names(emos) -> list[str]:
-    """Convert a row's labels to names, whether ints or strings."""
     global LABEL_NAMES
     if not emos:
         return []
@@ -163,73 +201,59 @@ def to_label_names(emos) -> list[str]:
     return [str(x) for x in emos]
 
 
-# ===== 5) Core mapping fn =====
+# ===== 5) Build final moods for a text =====
 def map_to_moods(text: str, emos: list[str], *, use_keywords: bool) -> list[str]:
-    """
-    Build final multi-label mood set:
-      - Always: base GoEmotions->Mood mapping (uses the dataset’s labels)
-      - If use_keywords=True (Train/Validation): add negation-aware boosts
-      - If use_keywords=False (Test): no boosts (keeps eval fair)
-    """
     t = (text or "").strip()
     moods = set()
 
-    # Base mapping from dataset labels
+    # base mapping from dataset labels
     for e in emos:
         moods.update(GO_TO_MOODS.get(e, []))
 
-    # surprise + obviously positive phrasing => happy
+    # positive surprise cue
     if "surprise" in emos and POS_SURPRISE.search(t):
         moods.add("happy")
 
     if not use_keywords:
         return sorted([m for m in moods if m in MOODS])
 
-    # ---- Negation-aware boosts ----
-    # calm
+    # negation-aware boosts
     if guarded_search(CALM_WORDS, t) or has_emoji(t, CALM_EMO):
         moods.add("calm")
 
-    # energetic
-    if guarded_search(ENERG_WORDS, t) or has_emoji(t, ENERG_EMO) or ENERG_SLANG.search(t):
-        # ensure the slang isn't negated either (e.g., "not hyped")
-        slang_m = ENERG_SLANG.search(t)
-        if (slang_m is None) or not_negated(slang_m.span(), t):
-            moods.add("energetic")
+    slang = ENERG_SLANG.search(t)
+    if guarded_search(ENERG_WORDS, t) or has_emoji(t, ENERG_EMO) or (slang and not_negated(slang.span(), t)):
+        moods.add("energetic")
 
-    # melancholy
     if guarded_search(MELAN_WORDS, t) or has_emoji(t, MEL_EMO):
         moods.add("melancholy")
 
-    # anxious
     if guarded_search(ANX_WORDS, t) or has_emoji(t, ANX_EMO) or ANX_EMOTICONS.search(t):
         moods.add("anxious")
 
-    # romantic
     if guarded_search(ROM_WORDS, t) or has_emoji(t, ROM_EMO) or ROM_EMOTICONS.search(t):
         moods.add("romantic")
 
-    # sad
     if guarded_search(SAD_WORDS, t) or has_emoji(t, SAD_EMO) or SAD_EMOTICONS.search(t):
         moods.add("sad")
 
-    # happy: slang/emoticons/emojis (conservative; lots of casual "lol")
     hsl = HAPPY_SLANG.search(t)
     if (hsl and not_negated(hsl.span(), t)) or HAPPY_EMOTICONS.search(t) or has_emoji(t, HAPPY_EMO):
         moods.add("happy")
 
-    # tiny nudge: neutral + calm cues
+    # small nudge: neutral + calm cues
     if "neutral" in emos and ("lofi" in t.lower() or guarded_search(CALM_WORDS, t)):
         moods.add("calm")
 
     return sorted([m for m in moods if m in MOODS])
 
 
-# ===== 6) Write splits and labels.json =====
-def write_split(split_ds, split_name: str, cap=None):
+# ===== 6) Write splits (TRAIN supports quota balancing) =====
+def write_split(split_ds, split_name: str, cap=None, quota_counts=None, target_per_label=None):
     """
-    Writes docs/<Split>/doc_*.txt locally and returns 'documents' entries for labels.json.
-    'dataset' must be exactly "Train" or "Test" for Language Studio.
+    TRAIN: keep a doc if it contributes to any under-target label; otherwise
+           keep with small probability to down-sample saturated labels.
+    VAL/TEST: no balancing; pass-through.
     """
     split_dir = DOCS_LOCAL / split_name.capitalize()  # Train / Validation / Test
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -246,10 +270,20 @@ def write_split(split_ds, split_name: str, cap=None):
         emos = raw if isinstance(raw, list) else [raw]
         emos = to_label_names(emos)
 
-        use_kw = (split_name in ("train", "validation"))  # boosts only on Train/Validation
+        use_kw = (split_name in ("train", "validation"))
         moods = map_to_moods(text, emos, use_keywords=use_kw)
         if not moods:
             continue
+
+        if split_name == "train" and quota_counts is not None and target_per_label is not None:
+            under = [m for m in moods if quota_counts[m] < target_per_label]
+            if not under:
+                # contributes only to saturated labels -> random keep
+                if random.random() > KEEP_SATURATED_PROB:
+                    continue
+            # keep, update counts for all labels this doc claims
+            for m in moods:
+                quota_counts[m] += 1
 
         fname_local = f"doc_{i:06d}.txt"
         (split_dir / fname_local).write_text(text, encoding="utf-8")
@@ -264,22 +298,28 @@ def write_split(split_ds, split_name: str, cap=None):
     return items
 
 
+# ======================= MAIN =========================
 def main():
     global LABEL_NAMES
 
     print("Loading GoEmotions …")
     ds = load_dataset("go_emotions", "simplified")
 
-    # Resolve label names from dataset feature metadata
     feats = ds["train"].features["labels"]
     LABEL_NAMES = getattr(getattr(feats, "feature", None), "names", None) or getattr(feats, "names", None)
     if not LABEL_NAMES:
         raise RuntimeError("Could not obtain label names from dataset features.")
 
     print("Writing docs + labels.json …")
-    train_items = write_split(ds["train"], "train", CAP_TRAIN)
-    val_items   = write_split(ds["validation"], "validation", CAP_VAL)
-    test_items  = write_split(ds["test"], "test", CAP_TEST)
+    train_quota_counts = Counter({m: 0 for m in MOODS})
+
+    train_items = write_split(
+        ds["train"], "train", CAP_TRAIN,
+        quota_counts=train_quota_counts,
+        target_per_label=TARGET_TRAIN_PER_LABEL
+    )
+    val_items  = write_split(ds["validation"], "validation", CAP_VAL)
+    test_items = write_split(ds["test"], "test", CAP_TEST)
 
     labels = {
         "projectFileVersion": "2022-05-01",
@@ -289,7 +329,7 @@ def main():
             "storageInputContainerName": CONTAINER_NAME,
             "projectName": PROJECT_NAME,
             "multilingual": False,
-            "description": "MoodTunes: 8 moods from GoEmotions + negation-aware heuristics",
+            "description": "MoodTunes: 8 moods (GoEmotions + negation-aware boosts + TRAIN rebalancing)",
             "language": LANG
         },
         "assets": {
@@ -317,9 +357,10 @@ def main():
     print("\nWrote:", OUT_ROOT / "labels.json")
     print("Local docs root:", DOCS_LOCAL.resolve())
     print("Blob prefix used in 'location':", BLOB_PREFIX)
-    print("Label counts (ALL):", dict(counts_all))
+    print("Label counts (ALL):  ", dict(counts_all))
     print("Label counts (TRAIN):", dict(counts_train))
-    print("Label counts (TEST):", dict(counts_test))
+    print("Label counts (TEST): ", dict(counts_test))
+    print("TRAIN quota progress:", dict(train_quota_counts))
 
 
 if __name__ == "__main__":
