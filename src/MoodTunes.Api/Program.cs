@@ -1,70 +1,35 @@
-// src/MoodTunes.Api/Program.cs
-using System.Threading.RateLimiting;
-using Microsoft.AspNetCore.RateLimiting;
-using Serilog;
+using MoodTunes.Application.Abstractions;
+using MoodTunes.Infrastructure.Classifiers;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// --- Serilog (reads from appsettings*.json) ---
-Log.Logger = new LoggerConfiguration()
-    .ReadFrom.Configuration(builder.Configuration)
-    .Enrich.FromLogContext()
-    .CreateLogger();
-builder.Host.UseSerilog();
-
-// --- Services ---
+// Controllers & CORS
 builder.Services.AddControllers();
+builder.Services.AddCors(o => o.AddDefaultPolicy(p => p
+    .WithOrigins("http://localhost:5173", "http://localhost:3000")
+    .AllowAnyHeader().AllowAnyMethod().AllowCredentials()
+));
 
-// Swagger / OpenAPI
+// DI: stub classifier for now
+builder.Services.AddScoped<IMoodClassifier, LocalRuleBasedClassifier>();
+
+// 🔹 Swagger registration (these two lines register ISwaggerProvider)
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// CORS (allow your frontends during dev; change to your actual domains later)
-builder.Services.AddCors(options =>
-{
-    options.AddDefaultPolicy(p => p
-        .WithOrigins(
-            "http://localhost:5173", // Vite
-            "http://localhost:3000"  // CRA/Next
-        )
-        .AllowAnyHeader()
-        .AllowAnyMethod()
-        .AllowCredentials()
-    );
-});
-
-// Global rate limiting (simple fixed window; tune for prod)
-builder.Services.AddRateLimiter(options =>
-{
-    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(_ =>
-        RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: "global",
-            factory: _ => new FixedWindowRateLimiterOptions
-            {
-                PermitLimit = 60,                 // 60 requests
-                Window = TimeSpan.FromMinutes(1), // per minute
-                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-                QueueLimit = 0
-            }));
-});
-
 var app = builder.Build();
 
-// --- Middleware pipeline ---
-app.UseSerilogRequestLogging(); // structured request logs
-app.UseCors();
-app.UseRateLimiter();
-
+// 🔹 Serve Swagger (dev only is fine)
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseSwagger();    // serves /swagger/v1/swagger.json
+    app.UseSwaggerUI();  // serves /swagger
 }
 
+// Pipeline
+app.UseCors();
 app.MapControllers();
-
-// Health probes
 app.MapGet("/_health", () => Results.Ok(new { ok = true }));
-app.MapGet("/_ready",  () => Results.Ok(new { ready = true }));
+app.MapGet("/api/v1/ping", () => Results.Ok(new { ok = true, service = "moodtunes-api" }));
 
 app.Run();

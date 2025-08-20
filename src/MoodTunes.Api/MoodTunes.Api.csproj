@@ -13,4 +13,9 @@
     <PackageReference Include="Swashbuckle.AspNetCore" Version="9.0.3" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\MoodTunes.Infrastructure\MoodTunes.Infrastructure.csproj" />
+    <ProjectReference Include="..\MoodTunes.Application\MoodTunes.Application.csproj" />
+  </ItemGroup>
+
 </Project>
