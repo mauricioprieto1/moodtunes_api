@@ -33,10 +33,13 @@ MIN_CHARS = 3
 MOODS = ["happy","calm","sad","melancholy","energetic","angry","anxious","romantic"]
 
 # ===== TRAIN rebalancing (downsample majority) =====
-TARGET_TRAIN_PER_LABEL = 7000   # approximate per-label target
-KEEP_SATURATED_PROB    = 0.15   # keep prob for docs that only hit saturated labels
+TARGET_TRAIN_PER_LABEL = 5500   # approximate per-label target
+KEEP_SATURATED_PROB    = 0.02   # keep prob for docs that only hit saturated labels
 RANDOM_SEED            = 42
 random.seed(RANDOM_SEED)
+
+SUPPRESSABLE_LABELS = {"happy", "energetic"}
+
 # ====================================================
 
 
@@ -275,13 +278,29 @@ def write_split(split_ds, split_name: str, cap=None, quota_counts=None, target_p
         if not moods:
             continue
 
+        # ---- TRAIN rebalancing gate ----
         if split_name == "train" and quota_counts is not None and target_per_label is not None:
+            # Under-target labels present on this doc?
             under = [m for m in moods if quota_counts[m] < target_per_label]
+
+            # If doc contributes only to labels already >= target, keep with a tiny probability
             if not under:
-                # contributes only to saturated labels -> random keep
                 if random.random() > KEEP_SATURATED_PROB:
-                    continue
-            # keep, update counts for all labels this doc claims
+                    continue  # drop: saturated-only doc
+
+            # If it DOES have any under-target label, keep the doc — but
+            # suppress saturated labels that would keep growing (e.g., happy/energetic)
+            if under:
+                trimmed = []
+                for m in moods:
+                    if m in SUPPRESSABLE_LABELS and quota_counts[m] >= target_per_label:
+                        continue  # drop saturated major label from this doc
+                    trimmed.append(m)
+
+                # Safety: never drop all labels; if we somehow removed everything, fall back to under-target set
+                moods = trimmed or under
+
+            # Update counts for the final label set we will emit
             for m in moods:
                 quota_counts[m] += 1
 
