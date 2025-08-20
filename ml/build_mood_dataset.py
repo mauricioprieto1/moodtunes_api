@@ -108,7 +108,7 @@ def write_split(split_ds, split_name: str, cap=None):
         items.append({
             "location": blob_location,
             "language": LANG,
-            "dataset": "Train" if split_name=="train" else ("Validation" if split_name=="validation" else "Test"),
+            "dataset": "Train" if split_name in ("train", "validation") else "Test",
             "classes": [{"category": m} for m in moods]
         })
     return items
